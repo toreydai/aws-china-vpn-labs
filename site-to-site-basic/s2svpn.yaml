@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'StrongSwan 软件 IPSec VPN — IKEv2, Amazon Linux 2023, 单节点'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 网络设置（已有 VPC）
+        Parameters:
+          - VpcId
+          - SubnetId
+          - RouteTableId
+          - LeftSubnet
+      - Label:
+          default: EC2 实例设置
+        Parameters:
+          - InstanceType
+          - KeypairName
+      - Label:
+          default: IPSec/IKEv2 设置
+        Parameters:
+          - PSK
+          - IKELifeTime
+          - SALifeTime
+      - Label:
+          default: 对端信息
+        Parameters:
+          - RightIp
+          - RightSubnet
+
+Parameters:
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: VPN 实例所在 VPC
+
+  SubnetId:
+    Type: 'AWS::EC2::Subnet::Id'
+    Description: VPN 实例所在公有子网
+
+  RouteTableId:
+    Type: String
+    AllowedPattern: '^rtb-[a-f0-9]+$'
+    Description: 需要添加对端路由的 VPC 路由表 ID（格式 rtb-xxxxxxxx）
+
+  LeftSubnet:
+    Type: String
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 本端网段（VPC CIDR 或子网 CIDR）
+
+  RightIp:
+    Type: String
+    Description: 对端 VPN 网关公网 IP
+
+  RightSubnet:
+    Type: String
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 对端网段
+
+  PSK:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: IPSec 预共享密钥（Pre-Shared Key），最少 20 位随机字符
+
+  IKELifeTime:
+    Type: String
+    Default: '86400s'
+    Description: IKE SA 生命周期（默认 24h）
+
+  SALifeTime:
+    Type: String
+    Default: '3600s'
+    Description: IPSec SA 生命周期（默认 1h）
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - c5.large
+      - c5.xlarge
+    Description: 实例规格（测试 t3.small，生产建议 c5.large）
+
+  KeypairName:
+    Type: String
+    Default: ''
+    Description: EC2 SSH 密钥对（可选，留空则仅支持 SSM Session Manager 登录）
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeypairName, '']]
+
+Resources:
+  # ---- IAM ----
+  VPNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-VPNRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com.cn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws-cn:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  VPNInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref VPNRole
+
+  # ---- EIP ----
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  EIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref VPNInstance
+      AllocationId: !GetAtt EIP.AllocationId
+
+  # ---- 安全组 ----
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: StrongSwan IPSec VPN Security Group
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: !Sub '${RightIp}/32'
+          Description: IKE
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: !Sub '${RightIp}/32'
+          Description: IPSec NAT-T
+        - IpProtocol: '50'
+          CidrIp: !Sub '${RightIp}/32'
+          Description: ESP
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPN-SG'
+
+  # ---- VPC 路由（对端网段 → VPN 实例）----
+  RemoteSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTableId
+      DestinationCidrBlock: !Ref RightSubnet
+      InstanceId: !Ref VPNInstance
+
+  # ---- EC2 实例 ----
+  VPNInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref VPNInstanceProfile
+      SourceDestCheck: false
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      KeyName: !If [HasKeyPair, !Ref KeypairName, !Ref 'AWS::NoValue']
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            Encrypted: true
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-StrongSwan'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource VPNInstance --region ${AWS::Region}' EXIT
+          timedatectl set-timezone Asia/Shanghai
+          printf '[epel-tuna]\nname=EPEL TUNA\nbaseurl=https://mirrors.tuna.tsinghua.edu.cn/epel/9/Everything/x86_64/\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/epel-tuna.repo
+          dnf install -y strongswan iptables-services
+          rm -f /etc/yum.repos.d/epel-tuna.repo
+
+          cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
+          net.ipv4.ip_forward = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.rp_filter = 0
+          net.ipv4.conf.all.rp_filter = 0
+          SYSCTL
+          sysctl --system
+
+          PUBLIC_IP=${EIP}
+
+          mkdir -p /etc/strongswan/swanctl/conf.d
+          cat > /etc/strongswan/swanctl/conf.d/site-to-site.conf <<SWANCTL
+          connections {
+            site-to-site {
+              version = 2
+              local_addrs = %any
+              remote_addrs = ${RightIp}
+              local {
+                auth = psk
+                id = $PUBLIC_IP
+              }
+              remote {
+                auth = psk
+                id = ${RightIp}
+              }
+              proposals = aes256-sha256-ecp256
+              rekey_time = ${IKELifeTime}
+              dpd_delay = 30s
+              dpd_timeout = 120s
+              children {
+                net {
+                  local_ts = ${LeftSubnet}
+                  remote_ts = ${RightSubnet}
+                  esp_proposals = aes256gcm128
+                  life_time = ${SALifeTime}
+                  start_action = start
+                  dpd_action = restart
+                  mode = tunnel
+                }
+              }
+            }
+          }
+
+          secrets {
+            ike-site-to-site {
+              id-1 = $PUBLIC_IP
+              id-2 = ${RightIp}
+              secret = "${PSK}"
+            }
+          }
+          SWANCTL
+          chmod 600 /etc/strongswan/swanctl/conf.d/site-to-site.conf
+
+          IFACE=$(ip route show default | awk '{print $5}' | head -1)
+          iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1387
+          iptables-save > /etc/sysconfig/iptables
+          systemctl enable --now iptables
+          systemctl enable --now strongswan
+          swanctl --load-all
+          swanctl --initiate --child net || true
+
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT8M
+
+Outputs:
+  VPNPublicIP:
+    Description: VPN 实例公网 IP（告知对端配置）
+    Value: !Ref EIP
+  VPNInstanceId:
+    Description: VPN 实例 ID
+    Value: !Ref VPNInstance
